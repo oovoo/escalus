@@ -52,7 +52,7 @@
               who/0]).
 
 %% Public types
--type who() :: all | {by_name, [escalus_config:key()]}.
+-type who() :: all | {by_name, [escalus_config:key()]} | [named_user()].
 -type user_spec() :: [{user_option(), any()}].
 
 %% Internal types
@@ -224,7 +224,9 @@ get_users(all) ->
     escalus_ct:get_config(escalus_users);
 get_users({by_name, Names}) ->
     All = get_users(all),
-    [get_user_by_name(Name, All) || Name <- Names].
+    [get_user_by_name(Name, All) || Name <- Names];
+get_users(Who) when is_list(Who) ->
+    Who.
 
 -spec get_user_by_name(user_name(), escalus:config()) -> {user_name(), escalus:config()}.
 get_user_by_name(Name, Users) ->
