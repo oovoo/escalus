@@ -157,7 +157,12 @@ is_headline_message(Subject, Msg, Stanza) ->
 has_type(undefined, Stanza) ->
     undefined == exml_query:attr(Stanza, <<"type">>);
 has_type(Type, Stanza) ->
-    bin(Type) == bin(exml_query:attr(Stanza, <<"type">>)).
+    has_type_2(Type, exml_query:attr(Stanza, <<"type">>)).
+
+has_type_2(_Type, undefined) ->
+    false;
+has_type_2(Type, Value) ->
+    bin(Type) == bin(Value).
 
 is_iq_set(Stanza) -> is_iq(<<"set">>, Stanza).
 is_iq_get(Stanza) -> is_iq(<<"get">>, Stanza).
