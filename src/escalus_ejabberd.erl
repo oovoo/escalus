@@ -122,7 +122,7 @@ with_local_option(Option, Value, Fun) ->
         Fun()
     after
         lists:foreach(
-            fun ({Host, [{local_config, {Host, _Opt}, OldValue}]}) ->
+            fun ({Host, [{local_config, {_Opt, Host}, OldValue}]}) ->
                     rpc(ejabberd_config, add_local_option, [{Option, Host}, OldValue]);
                 ({Host, []}) ->
                     rpc(mnesia, dirty_delete, [local_config, {Option, Host}])
