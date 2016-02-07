@@ -21,6 +21,7 @@
          make_everyone_friends/1,
          make_everyone_friends/2,
          start_ready_clients/2,
+         start_ready_clients/4,
          send_initial_presence/1]).
 
 -include("include/escalus.hrl").
@@ -31,9 +32,10 @@
 %%--------------------------------------------------------------------
 
 story(Config, ResourceCounts, Story) ->
-    ClientDescs = clients_from_resource_counts(Config, ResourceCounts),
+    {ClientDescs, OtherConfiguration} = clients_from_resource_counts(Config, ResourceCounts),
+    {NoFriendsClients, RestClients} = number_of_additional_clients_to_expect_or_ignore(OtherConfiguration),
     try
-        Clients = start_clients(Config, ClientDescs),
+        Clients = start_clients(Config, ClientDescs, NoFriendsClients, RestClients),
         ensure_all_clean(Clients),
         escalus_event:story_start(Config),
         apply(Story, Clients),
@@ -54,7 +56,7 @@ make_everyone_friends(Config) ->
 make_everyone_friends(Config0, Users) ->
     % start the clients
     Config1 = escalus_cleaner:start(Config0),
-    Clients = start_clients(Config1, [[{US, <<"friendly">>}] || {_Name, US} <- Users]),
+    Clients = start_clients(Config1, [[{Name, US, <<"friendly">>}] || {Name, US} <- Users]),
 
     % exchange subscribe and subscribed stanzas
     escalus_utils:distinct_pairs(fun(C1, C2) ->
@@ -81,26 +83,30 @@ make_everyone_friends(Config0, Users) ->
     % return Config0
     [{everyone_is_friends, true} | Config0].
 
-call_start_ready_clients(Config, UserCDs) ->
-    escalus_overridables:do(Config, start_ready_clients, [Config, UserCDs],
+call_start_ready_clients(Config, UserCDs, NoFriendsClients, RestClients) ->
+    escalus_overridables:do(Config, start_ready_clients, [Config, UserCDs, NoFriendsClients, RestClients],
                             {?MODULE, start_ready_clients}).
 
 start_ready_clients(Config, FlatCDs) ->
-    {_, RClients} = lists:foldl(fun({UserSpec, BaseResource}, {N, Acc}) ->
+    start_ready_clients(Config, FlatCDs, [], []).
+
+start_ready_clients(Config, FlatCDs, NoFriendsClients, RestClients) ->
+    {_, RClients} = lists:foldl(fun({User, UserSpec, BaseResource}, {N, Acc}) ->
         Resource = escalus_overridables:do(Config, modify_resource, [BaseResource],
                                            {escalus_utils, identity}),
         {ok, Client} = escalus_client:start(Config, UserSpec, Resource),
         escalus_overridables:do(Config, initial_activity, [Client],
                                 {?MODULE, send_initial_presence}),
-        %% drop 1 own presence + N-1 probe replies = N presence stanzas
-        drop_presences(Client, N),
+        %% drop 1 own presence + N-1 probe replies = N presence stanzas, minus self if I'm a REST client
+        ExpecetedPresences = get_number_of_expected_presences(N, User, NoFriendsClients, RestClients),
+        drop_presences(Client, ExpecetedPresences),
         {N+1, [Client|Acc]}
     end, {1, []}, FlatCDs),
     Clients = lists:reverse(RClients),
     ClientsCount = length(Clients),
     escalus_utils:each_with_index(fun(Client, N) ->
-        %% drop presence updates of guys who have logged in after you did
-        drop_presences(Client, ClientsCount - N)
+        %% drop presence updates of guys who have logged in after you did (except for users without friends)
+        drop_presences(Client, ClientsCount - N - length(NoFriendsClients))
     end, 1, Clients),
     ensure_all_clean(Clients),
     Clients.
@@ -129,17 +135,22 @@ ensure_all_clean(Clients) ->
     end, Clients).
 
 start_clients(Config, ClientDescs) ->
+    start_clients(Config, ClientDescs, [], []).
+
+start_clients(Config, ClientDescs, NoFriendsClients, RestClients) ->
     case proplists:get_bool(everyone_is_friends, Config) of
         true ->
-            call_start_ready_clients(Config, lists:append(ClientDescs));
+            call_start_ready_clients(Config, lists:append(ClientDescs), NoFriendsClients, RestClients);
         false ->
             lists:flatmap(fun(UserCDs) ->
-                call_start_ready_clients(Config, UserCDs)
+                call_start_ready_clients(Config, UserCDs, NoFriendsClients, RestClients)
             end, ClientDescs)
     end.
 
+drop_presences(Client, N) when N < 0 ->
+    drop_presences(Client, 0);
 drop_presences(Client, N) ->
-    Dropped = escalus_client:wait_for_stanzas(Client, N),
+    Dropped = escalus_client:wait_for_stanzas(Client, N + 2),
     [escalus:assert(is_presence, Stanza) || Stanza <- Dropped],
     N = length(Dropped).
 
@@ -160,18 +171,53 @@ zip_shortest(_, _) ->
     [].
 
 %% ResourceCounts is a list of tuples: [{alice,2}, {bob,1}]
-clients_from_resource_counts(Config, ResourceCounts = [{_, _} | _]) ->
+clients_from_resource_counts(Config, ResourcesAndConfiguration = [{_, _} | _]) ->
+    {Resources, OtherConfiguration} = lists:splitwith(
+        fun
+            ({config, _, _}) -> false;
+            (_) -> true
+        end, ResourcesAndConfiguration),
     NamedSpecs = escalus_config:get_config(escalus_users, Config),
-    [resources_per_spec(UserSpec, ResCount)
-     || { User, ResCount} <- ResourceCounts,
-        {_User, UserSpec} <- [lists:keyfind(User, 1, NamedSpecs)]];
+    {[resources_per_spec(UserFromConfig, UserSpec, ResCount)
+     || { User, ResCount} <- Resources,
+        {UserFromConfig, UserSpec} <- [lists:keyfind(User, 1, NamedSpecs)]], OtherConfiguration};
 %% Old-style ResourceCounts: [2, 1]
 clients_from_resource_counts(Config, ResourceCounts) ->
     NamedSpecs = escalus_config:get_config(escalus_users, Config),
-    [resources_per_spec(UserSpec, ResCount)
-     || {{_, UserSpec}, ResCount} <- zip_shortest(NamedSpecs,
-                                                  ResourceCounts)].
+    {[resources_per_spec(User, UserSpec, ResCount)
+     || {{User, UserSpec}, ResCount} <- zip_shortest(NamedSpecs,
+                                                  ResourceCounts)], []}.
 
-resources_per_spec(UserSpec, ResCount) ->
-    [{UserSpec, list_to_binary("res" ++ integer_to_list(N))}
+number_of_additional_clients_to_expect_or_ignore(Configuration) ->
+    number_of_additional_clients_to_expect_or_ignore_2(Configuration, [], []).
+
+number_of_additional_clients_to_expect_or_ignore_2([], NotFriendsAcc, RestUsersAcc) ->
+    {NotFriendsAcc, RestUsersAcc};
+number_of_additional_clients_to_expect_or_ignore_2([{config, rest, RestUser} | Tail], NotFriendsAcc, RestUsersAcc) when is_atom(RestUser) ->
+    number_of_additional_clients_to_expect_or_ignore_2(Tail, NotFriendsAcc, RestUsersAcc ++ [RestUser]);
+number_of_additional_clients_to_expect_or_ignore_2([{config, not_friends, NotFriendsUser} | Tail], NotFriendsAcc, RestUsersAcc) ->
+    number_of_additional_clients_to_expect_or_ignore_2(Tail, NotFriendsAcc ++ [NotFriendsUser], RestUsersAcc);
+number_of_additional_clients_to_expect_or_ignore_2([_ | Tail], NotFriendsAcc, RestUsersAcc) ->
+    number_of_additional_clients_to_expect_or_ignore_2(Tail, NotFriendsAcc, RestUsersAcc).
+
+resources_per_spec(User, UserSpec, ResCount) ->
+    [{User, UserSpec, list_to_binary("res" ++ integer_to_list(N))}
      || N <- lists:seq(1, ResCount)].
+
+get_number_of_expected_presences(N, User, NoFriendsClients, RestClients) ->
+    % The basic number of expected presences is 1 (for my own presence) + N - 1 (for my N - 1 friends), so N.
+    % But we need to add the number of REST clients already connected (unless I'm one of them).
+    Count = length(RestClients),
+    CountAfterRest = case lists:member(User, RestClients) of
+        true ->
+            Count - 1;
+        false ->
+            Count
+    end,
+    % But - if I don't have friends than I expect only 1 presence - my own
+    case lists:member(User, NoFriendsClients) of
+        true ->
+            1;
+        false ->
+            N + CountAfterRest
+    end.
